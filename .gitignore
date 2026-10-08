@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# local state and captures
+monitor-config.json
+usage-snapshot.json
+*.log
