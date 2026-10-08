@@ -524,6 +524,39 @@ def close_terminal_tab(wt_pid, title):
         return False
 
 
+k32.AttachConsole.argtypes = [wintypes.DWORD]
+k32.CreateFileW.restype = wintypes.HANDLE
+k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                          ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+# Terminal modes that a TUI enables and a forced kill leaves on: mouse tracking, focus reports,
+# bracketed paste, application cursor keys, alternate screen, extended keyboard protocols.
+TERMINAL_RESET = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l"
+                  "\x1b[?2004l\x1b[?1l\x1b[?1049l\x1b[<99u\x1b[>4;0m\x1b[0m\x1b[?25h")
+
+
+def write_to_console(shell_pid, text):
+    """Write `text` to the console (pseudo console) that `shell_pid` is attached to."""
+    k32.FreeConsole()  # the monitor has no console of its own; make sure of it before attaching
+    if not k32.AttachConsole(shell_pid):
+        return False
+    try:
+        handle = k32.CreateFileW("CONOUT$", 0xC0000000, 3, None, 3, 0, None)  # read+write, shared, open existing
+        if not handle or handle == INVALID_HANDLE:
+            return False
+        data = text.encode("utf-8")
+        written = wintypes.DWORD()
+        ok = k32.WriteFile(handle, data, len(data), ctypes.byref(written), None)
+        k32.CloseHandle(handle)
+        return bool(ok)
+    finally:
+        k32.FreeConsole()
+
+
+SHELLS = {"powershell.exe", "pwsh.exe", "cmd.exe", "bash.exe", "wsl.exe", "zsh.exe", "nu.exe"}
+
+
 def terminate_session(pid, proc_start, title=""):
     """Stop a session, closing its terminal tab when it can be identified with certainty.
 
@@ -535,6 +568,8 @@ def terminate_session(pid, proc_start, title=""):
         return False
     # The tab must be found before the kill: afterwards the shell renames it.
     table = process_table()
+    parent = table.get(pid, (0, ""))[0]
+    shell = parent if table.get(parent, (0, ""))[1].lower() in SHELLS else None
     p, host = pid, None
     for _ in range(12):
         p = table.get(p, (0, ""))[0]
@@ -543,17 +578,22 @@ def terminate_session(pid, proc_start, title=""):
         if table[p][1].lower() == "windowsterminal.exe":
             host = p
             break
-    if host:
-        close_terminal_tab(host, title)
+    tab_closed = bool(host) and close_terminal_tab(host, title)
     # Closing the tab ends the session by itself; this makes sure (and covers other terminals).
     if same_process(pid, proc_start):
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                        creationflags=CREATE_NO_WINDOW)
+    gone = False
     for _ in range(20):  # up to 2 s for the process to disappear
         if not same_process(pid, proc_start):
-            return True
+            gone = True
+            break
         time.sleep(0.1)
-    return False
+    # The terminal stays open: a forced kill leaves the modes of the Claude screen on (mouse tracking,
+    # focus reports...) and the shell would print garbage at every mouse move. Switch them off.
+    if gone and not tab_closed and shell:
+        write_to_console(shell, TERMINAL_RESET)
+    return gone
 
 
 # ---------------------------------------------------------------- Interface: constants and helpers
