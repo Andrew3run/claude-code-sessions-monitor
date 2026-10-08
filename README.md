@@ -59,7 +59,9 @@ Claude Code passes the plan limits to your status line command. To show them in 
 ## Safety
 
 - The monitor is read-only and never starts sessions. It is not the parent of any session, so closing the widget never closes a session.
-- A session is closed only from the ✕ button, after a confirmation dialog. Before terminating, it checks that the pid still is the same process, then runs `taskkill /PID <pid> /T /F` (the session and its children). The work in progress in that session is lost.
+- A session is closed only from the ✕ button, after a confirmation dialog. Before terminating, it checks that the pid still is the same process.
+- In Windows Terminal the session's tab is closed too, but only if exactly one tab matches the session title, so another session's tab can never be hit. Otherwise (renamed tab, other terminals) the session is stopped with `taskkill /PID <pid> /T /F` and the terminal stays open, showing what was left on screen.
+- The work in progress in that session is lost.
 - No network access, no telemetry.
 
 ## Limitations

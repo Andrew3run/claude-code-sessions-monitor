@@ -59,7 +59,9 @@ Claude Code passa i limiti del piano al comando della status line. Per mostrarli
 ## Sicurezza
 
 - Il monitor è di sola lettura e non avvia mai sessioni. Non è genitore di nessuna sessione, quindi chiudere il widget non chiude mai una sessione.
-- Una sessione si chiude solo dal pulsante ✕, dopo una finestra di conferma. Prima di terminare verifica che il pid sia ancora lo stesso processo, poi esegue `taskkill /PID <pid> /T /F` (la sessione e i suoi figli). Il lavoro in corso in quella sessione va perso.
+- Una sessione si chiude solo dal pulsante ✕, dopo una finestra di conferma. Prima di terminare verifica che il pid sia ancora lo stesso processo.
+- In Windows Terminal viene chiusa anche la scheda della sessione, ma solo se esattamente una scheda corrisponde al titolo della sessione, così la scheda di un'altra sessione non può mai essere colpita. Altrimenti (scheda rinominata, altri terminali) la sessione viene fermata con `taskkill /PID <pid> /T /F` e il terminale resta aperto, con quello che era rimasto a schermo.
+- Il lavoro in corso in quella sessione va perso.
 - Nessun accesso alla rete, nessuna telemetria.
 
 ## Limiti

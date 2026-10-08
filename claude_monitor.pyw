@@ -63,7 +63,7 @@ STRINGS = {
         "now": "now",
         "terminal_missing": "terminal not found", "close_failed": "could not close",
         "close_title": "Close session", "close_ask": "Close {name}?",
-        "close_warn": "Work in progress will be interrupted.",
+        "close_warn": "The session and its terminal will be closed.\nWork in progress will be interrupted.",
         "cancel": "Cancel", "close_confirm": "Close session",
         "days": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"), "day_unit": "d",
     },
@@ -81,7 +81,7 @@ STRINGS = {
         "now": "ora",
         "terminal_missing": "terminale non trovato", "close_failed": "chiusura non riuscita",
         "close_title": "Chiudi sessione", "close_ask": "Chiudere {name}?",
-        "close_warn": "Il lavoro in corso verrà interrotto.",
+        "close_warn": "La sessione e il suo terminale verranno chiusi.\nIl lavoro in corso verrà interrotto.",
         "cancel": "Annulla", "close_confirm": "Chiudi sessione",
         "days": ("lun", "mar", "mer", "gio", "ven", "sab", "dom"), "day_unit": "g",
     },
@@ -510,13 +510,50 @@ def focus_terminal(pid, title):
     return bool(hwnd)
 
 
-def terminate_session(pid, proc_start):
-    """Close a session and its children. Call only after the user confirmed."""
-    if DEMO or not same_process(pid, proc_start):
-        return DEMO
-    r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
+def close_terminal_tab(wt_pid, title):
+    """Close the Windows Terminal tab titled `title`, only if exactly one tab matches."""
+    if not title:
+        return False
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-File", str(TAB_SCRIPT),
+             "-WtPid", str(wt_pid), "-Title", title, "-Action", "close"],
+            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+        return "closed" in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def terminate_session(pid, proc_start, title=""):
+    """Stop a session, closing its terminal tab when it can be identified with certainty.
+
+    Call only after the user confirmed. Returns True once the session process is gone.
+    """
+    if DEMO:
+        return True
+    if not same_process(pid, proc_start):
+        return False
+    # The tab must be found before the kill: afterwards the shell renames it.
+    table = process_table()
+    p, host = pid, None
+    for _ in range(12):
+        p = table.get(p, (0, ""))[0]
+        if p not in table:
+            break
+        if table[p][1].lower() == "windowsterminal.exe":
+            host = p
+            break
+    if host:
+        close_terminal_tab(host, title)
+    # Closing the tab ends the session by itself; this makes sure (and covers other terminals).
+    if same_process(pid, proc_start):
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True,
                        creationflags=CREATE_NO_WINDOW)
-    return r.returncode == 0
+    for _ in range(20):  # up to 2 s for the process to disappear
+        if not same_process(pid, proc_start):
+            return True
+        time.sleep(0.1)
+    return False
 
 
 # ---------------------------------------------------------------- Interface: constants and helpers
@@ -1187,15 +1224,18 @@ class App:
                  padx=24).pack(anchor="w", pady=(22, 2))
         tk.Label(dlg, text=short_cwd(d["cwd"]), bg=BG, fg=MUTED, font=(FONT_FAMILY, 9),
                  padx=24).pack(anchor="w")
-        tk.Label(dlg, text=t("close_warn"), bg=BG, fg=DANGER, font=(FONT_FAMILY, 9),
+        tk.Label(dlg, text=t("close_warn"), bg=BG, fg=DANGER, font=(FONT_FAMILY, 9), justify="left",
                  padx=24).pack(anchor="w", pady=(10, 0))
         btns = tk.Frame(dlg, bg=BG)
         btns.pack(anchor="e", padx=24, pady=22)
 
         def go():
             dlg.destroy()
-            if not terminate_session(d["pid"], d["procStart"]):
-                self.summary.configure(text=t("close_failed"))
+
+            def work():  # closing a tab takes about a second: keep it off the interface thread
+                if not terminate_session(d["pid"], d["procStart"], d.get("title") or d["name"]):
+                    self.root.after(0, lambda: self.summary.configure(text=t("close_failed")))
+            threading.Thread(target=work, daemon=True).start()
 
         def button(text, cmd, fg, bg):
             b = tk.Label(btns, text=text, bg=bg, fg=fg, cursor="hand2", padx=16, pady=6,
