@@ -395,11 +395,11 @@ class Collector(threading.Thread):
             return None
         name, ts = min(tr.pending.values(), key=lambda v: v[1])
         age = now - ts
-        if name == "AskUserQuestion":
-            return ("question", name)
         if name == "ExitPlanMode":
             return ("plan", name) if age > 2 else None
-        if age > 8 and cpu < 5:
+        if name in SLOW_TOOLS or tr.mode in NO_PROMPT_MODES:
+            return None
+        if age > 15 and cpu < 5:
             return ("permission", name.rsplit("__", 1)[-1])
         return None
 
@@ -603,6 +603,14 @@ FG, MUTED, ACCENT = "#faf9f5", "#8a8780", "#d97757"
 OK, DANGER = "#7fb685", "#e0605a"
 BUSY, WAIT = "#8ad4e8", "#f0b84b"   # working (blue), waiting for the user (amber)
 OFF = "#5f5c57"                      # a filter that is switched off
+# The whole card carries the signal too: a tint plus an outline in the state color.
+# Modes where Claude Code never asks for permission, so a slow tool call is just a slow call.
+NO_PROMPT_MODES = {"auto", "bypassPermissions"}
+# Tools that legitimately sit without a result for a long time: never mistaken for a permission prompt.
+SLOW_TOOLS = {"AskUserQuestion", "Agent", "Task", "Monitor", "ScheduleWakeup", "WebFetch", "WebSearch", "TaskOutput"}
+# Dot and card of a session: normal (blue dot) while it works, steady green when finished, slowly
+# pulsing amber only while a request is pending (question, plan approval, permission).
+BREATH_SECONDS, BREATH_MIN = 2.0, 0.3  # one slow pulse every 2 s, never fully off
 # Permission mode of a session: id in the transcript -> (label, color)
 MODES = {
     "default": ("default", MUTED),
@@ -833,12 +841,26 @@ class Chart:
             c.create_oval(pts[-2] - 4, pts[-1] - 4, pts[-2] + 4, pts[-1] + 4, fill=color, outline=PANEL, width=2)
 
 
+def breath():
+    """Pulse brightness now, from BREATH_MIN to 1, smooth in time."""
+    phase = (time.monotonic() % BREATH_SECONDS) / BREATH_SECONDS
+    return BREATH_MIN + (1 - BREATH_MIN) * (0.5 + 0.5 * math.cos(phase * 2 * math.pi))
+
+
+def blend(fg, bg, k):
+    """fg over bg at strength k (0..1), both as #rrggbb."""
+    a, b = (tuple(int(c[i:i + 2], 16) for i in (1, 3, 5)) for c in (fg, bg))
+    return "#%02x%02x%02x" % tuple(round(y + (x - y) * k) for x, y in zip(a, b))
+
+
 class Row:
     COLS = (("cpu", 6), ("ram", 10), ("ctx", 9), ("out", 8))
 
     def __init__(self, app, parent):
         self.data = None
-        self.frame = tk.Frame(parent, bg=PANEL)
+        self.frame = tk.Frame(parent, bg=PANEL, highlightthickness=1,
+                              highlightbackground=PANEL, highlightcolor=PANEL)
+        self.bg, self.tick = PANEL, 0
         self.dot = tk.Label(self.frame, text="●", bg=PANEL, fg=MUTED, font=(FONT_FAMILY, 9))
         self.title = tk.Frame(self.frame, bg=PANEL)
         self.name = tk.Label(self.title, bg=PANEL, fg=FG, anchor="w", font=(FONT_FAMILY, 10))
@@ -894,10 +916,32 @@ class Row:
         if self.data:
             self.update(self.data)
 
-    def pulse(self, on):
-        """The dot blinks while the session waits for the user."""
-        if self.data and self.data["wait"]:
-            self.dot.configure(fg=self.dot_color if on else PANEL)
+    def pulse(self, tick):
+        """Called every 500 ms (the smooth pulse itself is App.breathe)."""
+        if self.data:
+            self.apply()
+
+    def apply(self):
+        """Tint and outline of the whole card, and the dot, for the current state."""
+        d = self.data
+        if d["wait"]:
+            color, k = WAIT, 0.16 * breath()
+        elif d["status"] == "idle":
+            color, k = OK, 0.07
+        else:
+            color, k = None, 0.0
+        bg = blend(color, PANEL, k) if color else PANEL
+        if bg != self.bg:
+            self.bg = bg
+            self.paint(self.frame, bg)
+        self.frame.configure(highlightbackground=blend(color, PANEL, min(1.0, k * 4)) if color else PANEL)
+        self.dot.configure(fg=blend(self.dot_color, bg, breath()) if d["wait"]
+                           else self.dot_color)
+
+    def paint(self, widget, bg):
+        widget.configure(bg=bg)
+        for child in widget.winfo_children():
+            self.paint(child, bg)
 
     def draw_bar(self):
         if not self.data:
@@ -920,7 +964,6 @@ class Row:
             text, self.dot_color = t("idle"), OK
         else:  # any other status (for example "shell") means the session is doing something
             text, self.dot_color = d["status"] or t("working"), BUSY
-        self.dot.configure(fg=self.dot_color)
         self.state.configure(text=text, fg=self.dot_color)
         mode, mode_color = MODES.get(d["mode"], (d["mode"], MUTED))
         self.mode.configure(text=mode, fg=mode_color)
@@ -932,6 +975,7 @@ class Row:
         self.vals["ram"].configure(text=fmt_ram(d["ram"]))
         self.vals["ctx"].configure(text=fmt_tokens(d["context"]))
         self.vals["out"].configure(text=fmt_tokens(d["output"]), fg=MUTED)
+        self.apply()
         self.draw_bar()
 
 
@@ -1032,6 +1076,7 @@ class App:
                 self.record_history(self.collector.snapshot)
         self.collector.start()
         self.poll()
+        self.breathe()
 
     def apply_layout(self):
         spec = LAYOUTS[self.layout]
@@ -1203,12 +1248,19 @@ class App:
     def poll(self):
         self.tick += 1
         for row in self.rows.values():
-            row.pulse(self.tick % 2 == 0)
+            row.pulse(self.tick)
         self.update_usage()
         if self.collector.version != self.seen_version:
             self.seen_version = self.collector.version
             self.render(self.collector.snapshot)
         self.root.after(500, self.poll)
+
+    def breathe(self):
+        """Redraws the pulsing cards about 20 times a second so the pulse is smooth."""
+        for row in self.rows.values():
+            if row.data and row.data["wait"]:
+                row.apply()
+        self.root.after(50, self.breathe)
 
     def fit_height(self):
         self.root.update_idletasks()
